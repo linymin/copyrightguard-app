@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Upload, ShieldCheck, Image as ImageIcon, AlertTriangle, CheckCircle, RefreshCw, ChevronRight, FileWarning, BarChart3, Wand2, Fingerprint, Search } from 'lucide-react';
+import { Upload, ShieldCheck, Image as ImageIcon, AlertTriangle, CheckCircle, RefreshCw, ChevronRight, FileWarning, BarChart3, Wand2, Fingerprint, Search, Loader2, Database } from 'lucide-react';
 import { AppState, UploadedImage, AssessmentResult, AnalysisStatus } from './types';
-import { analyzeImageRisk, blobToBase64, refinePrompt } from './services/geminiService';
+import { analyzeImageRisk, blobToBase64, refinePrompt, generateImageIndex, calculateCosineSimilarity } from './services/geminiService';
 import { calculateImageHash, calculateHammingDistance } from './services/imageUtils';
 import RiskChart from './components/RiskChart';
 
@@ -29,27 +29,92 @@ const App: React.FC = () => {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const galleryInputRef = useRef<HTMLInputElement>(null);
 
-  // Initialize gallery hashes if missing
+  // --- Background Indexing Logic ---
+  
+  // Helper to get base64 from URL (handles both data URI and remote URL)
+  const getBase64FromUrl = async (url: string): Promise<{ base64: string, mimeType: string } | null> => {
+    if (url.startsWith('data:')) {
+      const match = url.match(/^data:(.*?);base64,(.*)$/);
+      if (match) return { mimeType: match[1], base64: match[2] };
+    } else {
+      try {
+        const response = await fetch(url);
+        const blob = await response.blob();
+        const base64 = await blobToBase64(blob);
+        return { mimeType: blob.type, base64 };
+      } catch (e) {
+        console.warn("Fetch failed", url);
+      }
+    }
+    return null;
+  };
+
+  // Effect: Auto-index gallery images that are missing hash or embedding
   useEffect(() => {
-    const enrichGallery = async () => {
-      let changed = false;
-      const enriched = await Promise.all(gallery.map(async (img) => {
-        if (!img.hash) {
-          try {
-            const hash = await calculateImageHash(img.url);
-            changed = true;
-            return { ...img, hash };
-          } catch (e) {
-            console.warn("Failed to hash gallery image", img.id, e);
-            return img;
+    const processGallery = async () => {
+      // Find first image that needs processing and isn't currently indexing
+      const pendingIndex = gallery.findIndex(img => 
+        (!img.hash || !img.embedding) && !img.isIndexing
+      );
+
+      if (pendingIndex !== -1) {
+        const img = gallery[pendingIndex];
+        
+        // Mark as indexing
+        const newGallery = [...gallery];
+        newGallery[pendingIndex] = { ...img, isIndexing: true };
+        setGallery(newGallery);
+
+        try {
+          // Process
+          const data = await getBase64FromUrl(img.url);
+          let hash = img.hash;
+          let embedding = img.embedding;
+          let description = img.description;
+
+          if (data) {
+             // 1. pHash (Fast)
+             if (!hash) {
+                hash = await calculateImageHash(img.url);
+             }
+             // 2. Embedding (Slow, call API)
+             if (!embedding) {
+                const indexData = await generateImageIndex(data.base64, data.mimeType);
+                embedding = indexData.embedding;
+                description = indexData.description;
+             }
           }
+
+          // Update Gallery
+          setGallery(prev => {
+             const updated = [...prev];
+             updated[pendingIndex] = { 
+               ...img, 
+               hash, 
+               embedding, 
+               description, 
+               isIndexing: false 
+             };
+             return updated;
+          });
+
+        } catch (e) {
+          console.error("Indexing failed for", img.name, e);
+          // Mark as not indexing but failed (maybe add retry count later)
+          setGallery(prev => {
+             const updated = [...prev];
+             updated[pendingIndex] = { ...img, isIndexing: false };
+             return updated;
+          });
         }
-        return img;
-      }));
-      if (changed) setGallery(enriched);
+      }
     };
-    enrichGallery();
-  }, [gallery.length]);
+    
+    // Simple debounce/throttle via timeout to avoid flooding
+    const timer = setTimeout(processGallery, 500);
+    return () => clearTimeout(timer);
+  }, [gallery]);
+
 
   // --- Handlers ---
 
@@ -60,19 +125,13 @@ const App: React.FC = () => {
         const file = e.target.files[i];
         const base64 = await blobToBase64(file);
         const url = `data:${file.type};base64,${base64}`;
-        let hash = undefined;
-        try {
-           hash = await calculateImageHash(url);
-        } catch (e) {
-           console.error("Hash calculation failed", e);
-        }
-
+        
+        // Create entry immediately, indexing will happen in background effect
         newImages.push({
           id: `new_${Date.now()}_${i}`,
           url,
           name: file.name,
           uploadedAt: Date.now(),
-          hash
         });
       }
       setGallery([...gallery, ...newImages]);
@@ -107,92 +166,97 @@ const App: React.FC = () => {
     }
   };
 
-  const getMimeTypeFromUrl = (url: string) => {
-    const match = url.match(/^data:(.*?);base64,/);
-    return match ? match[1] : 'image/jpeg';
-  };
-
   const startAssessment = async () => {
     if (!targetImage || gallery.length === 0) return;
 
-    setStatus({ step: 'analyzing', progress: 0 });
+    // Phase 1: Analyze Target (Get Embedding)
+    setStatus({ step: 'indexing', progress: 10, currentFile: '正在分析目标图片特征...' });
     
-    const targetMime = getMimeTypeFromUrl(targetImage.url);
-    const targetBase64 = targetImage.url.split(',')[1];
-    
-    // Process in batches of 3 to avoid rate limits but improve speed
-    const BATCH_SIZE = 3;
-    const allResults: AssessmentResult[] = [];
-    const totalRefs = gallery.length;
+    const targetData = await getBase64FromUrl(targetImage.url);
+    if (!targetData) return;
 
-    for (let i = 0; i < totalRefs; i += BATCH_SIZE) {
-      const batch = gallery.slice(i, i + BATCH_SIZE);
+    let targetEmbedding = targetImage.embedding;
+    if (!targetEmbedding) {
+      const indexResult = await generateImageIndex(targetData.base64, targetData.mimeType);
+      targetEmbedding = indexResult.embedding;
+      // Optionally save back to state if we wanted to cache it
+    }
+
+    // Phase 2: Retrieval (Vector Search & pHash Filter)
+    setStatus({ step: 'retrieving', progress: 30, currentFile: '全库快速检索中...' });
+    
+    const candidates = gallery.map(ref => {
+      // 1. pHash Distance (Priority)
+      let isPHashMatch = false;
+      let hashDist = 100;
+      if (targetImage.hash && ref.hash) {
+         hashDist = calculateHammingDistance(targetImage.hash, ref.hash);
+         if (hashDist <= 8) isPHashMatch = true;
+      }
+
+      // 2. Vector Similarity
+      let similarity = 0;
+      if (targetEmbedding && ref.embedding) {
+        similarity = calculateCosineSimilarity(targetEmbedding, ref.embedding);
+      }
+
+      return { ref, isPHashMatch, similarity };
+    });
+
+    // Sort candidates: pHash matches first, then high vector similarity
+    candidates.sort((a, b) => {
+       if (a.isPHashMatch && !b.isPHashMatch) return -1;
+       if (!a.isPHashMatch && b.isPHashMatch) return 1;
+       return b.similarity - a.similarity;
+    });
+
+    // Take top 5 candidates for Deep Analysis
+    const topCandidates = candidates.slice(0, 5);
+
+    // Phase 3: Deep Analysis (豆包)
+    setStatus({ step: 'analyzing', progress: 50 });
+    
+    const analysisResults: AssessmentResult[] = [];
+    const totalDeepScan = topCandidates.length;
+
+    for (let i = 0; i < totalDeepScan; i++) {
+      const candidate = topCandidates[i];
+      const refImg = candidate.ref;
       
-      const batchPromises = batch.map(async (refImg) => {
-        // 1. pHash Check
-        let isPHashMatch = false;
-        let hashDist = -1;
-        
-        if (targetImage.hash && refImg.hash) {
-          hashDist = calculateHammingDistance(targetImage.hash, refImg.hash);
-          if (hashDist >= 0 && hashDist <= 8) { // Slightly looser threshold for "suspicious"
-            isPHashMatch = true;
-          }
-        }
-
-        let refBase64 = '';
-        let refMime = 'image/jpeg';
-
-        if (refImg.url.startsWith('data:')) {
-            refMime = getMimeTypeFromUrl(refImg.url);
-            refBase64 = refImg.url.split(',')[1];
-        } else {
-            try {
-               const response = await fetch(refImg.url);
-               const blob = await response.blob();
-               refMime = blob.type;
-               refBase64 = await blobToBase64(blob);
-            } catch (e) {
-               console.warn("Could not fetch remote reference image", refImg.name);
-               return null;
-            }
-        }
-
-        // 2. Gemini Analysis
-        return analyzeImageRisk(
-          targetBase64, 
-          targetMime, 
-          refBase64, 
-          refMime, 
-          refImg.id, 
-          isPHashMatch
-        );
-      });
-
       setStatus({ 
         step: 'analyzing', 
-        progress: Math.floor(((i + 1) / totalRefs) * 100),
-        currentFile: `正在扫描第 ${i+1}-${Math.min(i+BATCH_SIZE, totalRefs)} 张...`
+        progress: 50 + Math.floor(((i) / totalDeepScan) * 50),
+        currentFile: `深度比对: ${refImg.name} (相似度 ${(candidate.similarity * 100).toFixed(1)}%)`
       });
 
-      const batchResults = await Promise.all(batchPromises);
-      batchResults.forEach(r => {
-        if (r && r.scores.total > 0) allResults.push(r);
-      });
+      const refData = await getBase64FromUrl(refImg.url);
+      if (!refData) continue;
+
+      const result = await analyzeImageRisk(
+        targetData.base64, 
+        targetData.mimeType, 
+        refData.base64, 
+        refData.mimeType, 
+        refImg.id, 
+        candidate.isPHashMatch
+      );
+      
+      // Inject the vector similarity for reference
+      result.vectorSimilarity = candidate.similarity;
+      
+      if (result.scores.total > 0) {
+        analysisResults.push(result);
+      }
     }
 
     setStatus({ step: 'complete', progress: 100 });
     
-    // Sort logic: pHash matches first, then by total score
-    allResults.sort((a, b) => {
-      if (a.pHashMatch && !b.pHashMatch) return -1;
-      if (!a.pHashMatch && b.pHashMatch) return 1;
-      return b.scores.total - a.scores.total;
-    });
+    // Sort final results by risk score
+    analysisResults.sort((a, b) => b.scores.total - a.scores.total);
     
-    setResults(allResults);
-    if (allResults.length > 0) {
-      setSelectedResult(allResults[0]);
+    setResults(analysisResults);
+    if (analysisResults.length > 0) {
+      setSelectedResult(analysisResults[0]);
     }
   };
 
@@ -211,60 +275,84 @@ const App: React.FC = () => {
 
   // --- Render Helpers ---
 
-  const renderGallery = () => (
-    <div className="p-6">
-      <div className="flex justify-between items-center mb-6">
-        <div>
-          <h2 className="text-2xl font-bold text-slate-800">企业核心资产库</h2>
-          <p className="text-slate-500 text-sm mt-1">
-            已建立索引 {gallery.length} 张受保护图片。系统将自动进行像素级查重和 AI 语义比对。
-          </p>
-        </div>
-        <button 
-          onClick={() => galleryInputRef.current?.click()}
-          className="flex items-center gap-2 bg-slate-900 hover:bg-slate-800 text-white px-4 py-2 rounded-lg transition-colors"
-        >
-          <Upload size={18} />
-          <span>批量入库</span>
-        </button>
-        <input 
-          type="file" 
-          multiple 
-          ref={galleryInputRef} 
-          className="hidden" 
-          accept="image/*" 
-          onChange={handleGalleryUpload} 
-        />
-      </div>
-
-      <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-4">
-        {gallery.map((img) => (
-          <div key={img.id} className="group relative aspect-square bg-white rounded-xl overflow-hidden border border-slate-200 shadow-sm hover:shadow-md transition-shadow">
-            <img src={img.url} alt={img.name} className="w-full h-full object-cover" />
-            <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex flex-col justify-end p-3">
-              <span className="text-white text-xs font-medium truncate w-full">{img.name}</span>
-              {img.hash && (
-                <span className="text-white/70 text-[10px] flex items-center gap-1 mt-1">
-                   <Fingerprint size={10} /> Hash ID: {img.hash.substring(0,8)}...
-                </span>
+  const renderGallery = () => {
+    const indexedCount = gallery.filter(g => g.embedding).length;
+    
+    return (
+      <div className="p-6">
+        <div className="flex justify-between items-center mb-6">
+          <div>
+            <h2 className="text-2xl font-bold text-slate-800">企业核心资产库</h2>
+            <div className="flex items-center gap-2 mt-1">
+              <p className="text-slate-500 text-sm">
+                 共 {gallery.length} 张图片 | 已建立向量索引: {indexedCount}
+              </p>
+              {indexedCount < gallery.length && (
+                 <span className="flex items-center gap-1 text-xs text-blue-600 bg-blue-50 px-2 py-0.5 rounded-full animate-pulse">
+                   <Database size={10} /> 正在后台索引中...
+                 </span>
               )}
             </div>
-            <div className="absolute top-2 right-2 bg-green-500 text-white text-[10px] px-2 py-0.5 rounded-full font-bold shadow-sm">
-              已保护
-            </div>
           </div>
-        ))}
-        
-        <div 
-          onClick={() => galleryInputRef.current?.click()}
-          className="aspect-square bg-slate-50 rounded-xl border-2 border-dashed border-slate-300 flex flex-col items-center justify-center cursor-pointer hover:bg-slate-100 text-slate-400 hover:text-slate-600 transition-colors"
-        >
-          <Upload size={32} />
-          <span className="text-sm mt-2 font-medium">添加图片</span>
+          <button 
+            onClick={() => galleryInputRef.current?.click()}
+            className="flex items-center gap-2 bg-slate-900 hover:bg-slate-800 text-white px-4 py-2 rounded-lg transition-colors"
+          >
+            <Upload size={18} />
+            <span>批量入库</span>
+          </button>
+          <input 
+            type="file" 
+            multiple 
+            ref={galleryInputRef} 
+            className="hidden" 
+            accept="image/*" 
+            onChange={handleGalleryUpload} 
+          />
+        </div>
+  
+        <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-4">
+          {gallery.map((img) => (
+            <div key={img.id} className="group relative aspect-square bg-white rounded-xl overflow-hidden border border-slate-200 shadow-sm hover:shadow-md transition-shadow">
+              <img src={img.url} alt={img.name} className="w-full h-full object-cover" />
+              <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex flex-col justify-end p-3">
+                <span className="text-white text-xs font-medium truncate w-full">{img.name}</span>
+                {img.embedding && (
+                  <span className="text-green-300 text-[10px] flex items-center gap-1 mt-1">
+                     <Database size={10} /> 已索引
+                  </span>
+                )}
+              </div>
+              {/* Status Badge */}
+              <div className="absolute top-2 right-2">
+                 {img.isIndexing ? (
+                   <div className="bg-blue-500 text-white p-1 rounded-full shadow-sm animate-spin">
+                      <Loader2 size={12} />
+                   </div>
+                 ) : img.embedding ? (
+                   <div className="bg-green-500 text-white text-[10px] px-2 py-0.5 rounded-full font-bold shadow-sm">
+                     已保护
+                   </div>
+                 ) : (
+                   <div className="bg-slate-300 text-slate-600 text-[10px] px-2 py-0.5 rounded-full font-bold shadow-sm">
+                     待处理
+                   </div>
+                 )}
+              </div>
+            </div>
+          ))}
+          
+          <div 
+            onClick={() => galleryInputRef.current?.click()}
+            className="aspect-square bg-slate-50 rounded-xl border-2 border-dashed border-slate-300 flex flex-col items-center justify-center cursor-pointer hover:bg-slate-100 text-slate-400 hover:text-slate-600 transition-colors"
+          >
+            <Upload size={32} />
+            <span className="text-sm mt-2 font-medium">添加图片</span>
+          </div>
         </div>
       </div>
-    </div>
-  );
+    );
+  };
 
   const renderAssessment = () => {
     // 1. Upload View
@@ -280,7 +368,7 @@ const App: React.FC = () => {
                 <ShieldCheck size={40} />
               </div>
               <h3 className="text-xl font-bold text-slate-800 mb-2">上传待检测图片</h3>
-              <p className="text-slate-500 mb-6">系统将自动运行 pHash 快速查重与 Gemini 深度语义鉴定。</p>
+              <p className="text-slate-500 mb-6">采用 RAG 检索增强技术，支持超大规模图库秒级查重。</p>
               <button className="bg-blue-600 text-white px-8 py-3 rounded-full font-bold shadow-lg shadow-blue-200 group-hover:shadow-blue-300 transition-transform active:scale-95">
                 上传文件
               </button>
@@ -301,8 +389,6 @@ const App: React.FC = () => {
       ? gallery.find(g => g.id === selectedResult.referenceImageId) 
       : null;
     
-    const hasHighRisk = results.some(r => r.scores.total >= 60);
-
     return (
       <div className="flex h-full min-h-[calc(100vh-140px)] bg-white rounded-xl border border-slate-200 overflow-hidden shadow-sm">
         {/* Left: Input & Matches List */}
@@ -325,14 +411,19 @@ const App: React.FC = () => {
                 className="w-full mt-4 bg-blue-600 hover:bg-blue-700 text-white py-2.5 rounded-lg font-bold flex items-center justify-center gap-2 transition-all shadow-md shadow-blue-200 active:scale-95"
               >
                 <Search size={18} />
-                开始全库扫描
+                开始全库检索
               </button>
             )}
 
             {status.step !== 'idle' && status.step !== 'complete' && (
               <div className="mt-4">
                 <div className="flex justify-between text-xs font-bold text-blue-600 mb-1">
-                  <span>{status.progress}% 扫描中...</span>
+                  <span>
+                    {status.step === 'indexing' && '特征提取中...'}
+                    {status.step === 'retrieving' && '向量检索中...'}
+                    {status.step === 'analyzing' && '深度鉴定中...'}
+                  </span>
+                  <span>{status.progress}%</span>
                 </div>
                 <div className="w-full bg-blue-100 rounded-full h-1.5 overflow-hidden mb-2">
                   <div 
@@ -349,8 +440,8 @@ const App: React.FC = () => {
             {status.step === 'complete' && results.length === 0 && (
                <div className="text-center py-12 px-4 text-slate-400">
                  <CheckCircle size={32} className="mx-auto text-green-500 mb-2" />
-                 <p className="font-medium text-slate-600 text-sm">全库安全</p>
-                 <p className="text-xs mt-1">未发现任何相似风险</p>
+                 <p className="font-medium text-slate-600 text-sm">未发现高风险目标</p>
+                 <p className="text-xs mt-1">检索了库中 {gallery.length} 张图片</p>
                </div>
             )}
 
@@ -388,7 +479,9 @@ const App: React.FC = () => {
                     </div>
                     <div className="text-[10px] text-slate-500 flex items-center gap-1">
                        {res.pHashMatch && <Fingerprint size={10} className="text-red-500" />}
-                       <span className="truncate">{res.pHashMatch ? 'Hash 命中' : (isHighRisk ? '语义相似' : '低风险')}</span>
+                       <span className="truncate">
+                         {res.pHashMatch ? 'Hash 命中' : `相似度 ${((res.vectorSimilarity || 0) * 100).toFixed(0)}%`}
+                       </span>
                     </div>
                   </div>
                   <ChevronRight size={14} className={`text-slate-300 ${isActive ? 'text-blue-500' : 'group-hover:text-slate-400'}`} />
@@ -421,7 +514,8 @@ const App: React.FC = () => {
                    </h2>
                    <p className="text-sm mt-1 opacity-80 text-slate-800">
                      对比源：{matchedRefImage.name} 
-                     {selectedResult.pHashMatch && <span className="ml-2 font-bold">(pHash 指纹一致)</span>}
+                     {selectedResult.pHashMatch && <span className="ml-2 font-bold text-red-600">(pHash 指纹一致)</span>}
+                     {selectedResult.vectorSimilarity && <span className="ml-2 opacity-60">(向量距离: {selectedResult.vectorSimilarity.toFixed(2)})</span>}
                    </p>
                  </div>
                  <div className="text-center px-6 border-l border-black/5">
