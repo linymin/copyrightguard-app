@@ -1,0 +1,5 @@
+{
+  "name": "CopyrightGuard AI - AIGC 图片版权风险评估与智能规避",
+  "description": "面向企业的智能版权风险评估系统。利用多模态大模型进行图像特征提取、语义交叉验证与多维风险评分，提供实时合规建议与智能修改方案。",
+  "requestFramePermissions": []
+}
