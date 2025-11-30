@@ -1,7 +1,7 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Upload, ShieldCheck, Image as ImageIcon, AlertTriangle, CheckCircle, RefreshCw, ChevronRight, FileWarning, BarChart3, Wand2, Fingerprint, Search } from 'lucide-react';
-import { AppState, UploadedImage, AssessmentResult, AnalysisStatus } from './types';
-import { analyzeImageRisk, blobToBase64, refinePrompt } from './services/geminiService';
+import { Upload, ShieldCheck, Image as ImageIcon, AlertTriangle, CheckCircle, RefreshCw, ChevronRight, FileWarning, BarChart3, Wand2, Fingerprint, Search, Trash2, CheckSquare, Square, Clock, ArrowRight } from 'lucide-react';
+import { AppState, UploadedImage, AssessmentResult, AnalysisStatus, HistoryRecord } from './types';
+import { analyzeImageRisk, blobToBase64, refinePrompt } from './services/doubaoService';
 import { calculateImageHash, calculateHammingDistance } from './services/imageUtils';
 import RiskChart from './components/RiskChart';
 
@@ -17,6 +17,10 @@ const App: React.FC = () => {
   const [appState, setAppState] = useState<AppState>(AppState.GALLERY);
   const [gallery, setGallery] = useState<UploadedImage[]>(INITIAL_GALLERY);
   
+  // Gallery Management State
+  const [isSelectionMode, setIsSelectionMode] = useState(false);
+  const [selectedGalleryIds, setSelectedGalleryIds] = useState<Set<string>>(new Set());
+
   // Assessment State
   const [targetImage, setTargetImage] = useState<UploadedImage | null>(null);
   const [results, setResults] = useState<AssessmentResult[]>([]);
@@ -24,6 +28,9 @@ const App: React.FC = () => {
   const [selectedResult, setSelectedResult] = useState<AssessmentResult | null>(null);
   const [refinedPrompt, setRefinedPrompt] = useState<string | null>(null);
   const [isGeneratingPrompt, setIsGeneratingPrompt] = useState(false);
+
+  // History State
+  const [history, setHistory] = useState<HistoryRecord[]>([]);
 
   // References
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -79,6 +86,24 @@ const App: React.FC = () => {
     }
   };
 
+  const toggleGallerySelection = (id: string) => {
+    const newSet = new Set(selectedGalleryIds);
+    if (newSet.has(id)) {
+      newSet.delete(id);
+    } else {
+      newSet.add(id);
+    }
+    setSelectedGalleryIds(newSet);
+  };
+
+  const deleteSelectedGalleryImages = () => {
+    if (confirm(`确定要删除选中的 ${selectedGalleryIds.size} 张图片吗？`)) {
+      setGallery(gallery.filter(img => !selectedGalleryIds.has(img.id)));
+      setSelectedGalleryIds(new Set());
+      setIsSelectionMode(false);
+    }
+  };
+
   const handleTargetUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     if (e.target.files && e.target.files[0]) {
       const file = e.target.files[0];
@@ -120,8 +145,8 @@ const App: React.FC = () => {
     const targetMime = getMimeTypeFromUrl(targetImage.url);
     const targetBase64 = targetImage.url.split(',')[1];
     
-    // Process in batches of 3 to avoid rate limits but improve speed
-    const BATCH_SIZE = 3;
+    // Process in batches of 1 to avoid rate limits
+    const BATCH_SIZE = 1;
     const allResults: AssessmentResult[] = [];
     const totalRefs = gallery.length;
 
@@ -135,7 +160,7 @@ const App: React.FC = () => {
         
         if (targetImage.hash && refImg.hash) {
           hashDist = calculateHammingDistance(targetImage.hash, refImg.hash);
-          if (hashDist >= 0 && hashDist <= 8) { // Slightly looser threshold for "suspicious"
+          if (hashDist >= 0 && hashDist <= 8) { 
             isPHashMatch = true;
           }
         }
@@ -158,8 +183,8 @@ const App: React.FC = () => {
             }
         }
 
-        // 2. Gemini Analysis
-        return analyzeImageRisk(
+        // Add 60s timeout to allow for retries (backoff can take 30s+)
+        const analysisPromise = analyzeImageRisk(
           targetBase64, 
           targetMime, 
           refBase64, 
@@ -167,23 +192,33 @@ const App: React.FC = () => {
           refImg.id, 
           isPHashMatch
         );
+        
+        const timeoutPromise = new Promise<null>((resolve) => 
+           setTimeout(() => resolve(null), 60000)
+        );
+
+        return Promise.race([analysisPromise, timeoutPromise]);
       });
 
+      // Update generic status message
       setStatus({ 
         step: 'analyzing', 
         progress: Math.floor(((i + 1) / totalRefs) * 100),
-        currentFile: `正在扫描第 ${i+1}-${Math.min(i+BATCH_SIZE, totalRefs)} 张...`
+        currentFile: "正在进行深度风险比对..." 
       });
 
       const batchResults = await Promise.all(batchPromises);
       batchResults.forEach(r => {
         if (r && r.scores.total > 0) allResults.push(r);
       });
+      
+      // Artificial delay to prevent 429
+      await new Promise(r => setTimeout(r, 2000));
     }
 
     setStatus({ step: 'complete', progress: 100 });
     
-    // Sort logic: pHash matches first, then by total score
+    // Sort logic
     allResults.sort((a, b) => {
       if (a.pHashMatch && !b.pHashMatch) return -1;
       if (!a.pHashMatch && b.pHashMatch) return 1;
@@ -194,6 +229,15 @@ const App: React.FC = () => {
     if (allResults.length > 0) {
       setSelectedResult(allResults[0]);
     }
+
+    // Save to History
+    const newHistoryRecord: HistoryRecord = {
+      id: `hist_${Date.now()}`,
+      timestamp: Date.now(),
+      targetImage: targetImage,
+      results: allResults
+    };
+    setHistory(prev => [newHistoryRecord, ...prev].slice(0, 10)); // Keep last 10
   };
 
   const handleGeneratePrompt = async () => {
@@ -209,49 +253,97 @@ const App: React.FC = () => {
     }
   };
 
+  const restoreHistory = (record: HistoryRecord) => {
+    setTargetImage(record.targetImage);
+    setResults(record.results);
+    setSelectedResult(record.results.length > 0 ? record.results[0] : null);
+    setStatus({ step: 'complete', progress: 100 });
+    setAppState(AppState.ASSESS);
+  };
+
   // --- Render Helpers ---
 
   const renderGallery = () => (
     <div className="p-6">
       <div className="flex justify-between items-center mb-6">
         <div>
-          <h2 className="text-2xl font-bold text-slate-800">企业核心资产库</h2>
+          <h2 className="text-2xl font-bold text-slate-800">比对样本库</h2>
           <p className="text-slate-500 text-sm mt-1">
-            已建立索引 {gallery.length} 张受保护图片。系统将自动进行像素级查重和 AI 语义比对。
+            已建立索引 {gallery.length} 张样本图片。系统将自动进行像素级查重和 AI 语义比对。
           </p>
         </div>
-        <button 
-          onClick={() => galleryInputRef.current?.click()}
-          className="flex items-center gap-2 bg-slate-900 hover:bg-slate-800 text-white px-4 py-2 rounded-lg transition-colors"
-        >
-          <Upload size={18} />
-          <span>批量入库</span>
-        </button>
-        <input 
-          type="file" 
-          multiple 
-          ref={galleryInputRef} 
-          className="hidden" 
-          accept="image/*" 
-          onChange={handleGalleryUpload} 
-        />
+        <div className="flex gap-2">
+          {isSelectionMode ? (
+            <>
+              <button 
+                onClick={deleteSelectedGalleryImages}
+                disabled={selectedGalleryIds.size === 0}
+                className="flex items-center gap-2 bg-red-100 hover:bg-red-200 text-red-600 px-4 py-2 rounded-lg transition-colors disabled:opacity-50"
+              >
+                <Trash2 size={18} />
+                <span>删除 ({selectedGalleryIds.size})</span>
+              </button>
+              <button 
+                onClick={() => { setIsSelectionMode(false); setSelectedGalleryIds(new Set()); }}
+                className="bg-slate-100 hover:bg-slate-200 text-slate-600 px-4 py-2 rounded-lg transition-colors"
+              >
+                取消
+              </button>
+            </>
+          ) : (
+            <button 
+              onClick={() => setIsSelectionMode(true)}
+              className="bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 px-4 py-2 rounded-lg transition-colors"
+            >
+              批量管理
+            </button>
+          )}
+          <button 
+            onClick={() => galleryInputRef.current?.click()}
+            className="flex items-center gap-2 bg-slate-900 hover:bg-slate-800 text-white px-4 py-2 rounded-lg transition-colors"
+          >
+            <Upload size={18} />
+            <span>批量入库</span>
+          </button>
+          <input 
+            type="file" 
+            multiple 
+            ref={galleryInputRef} 
+            className="hidden" 
+            accept="image/*" 
+            onChange={handleGalleryUpload} 
+          />
+        </div>
       </div>
 
       <div className="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-5 gap-4">
         {gallery.map((img) => (
-          <div key={img.id} className="group relative aspect-square bg-white rounded-xl overflow-hidden border border-slate-200 shadow-sm hover:shadow-md transition-shadow">
+          <div 
+            key={img.id} 
+            onClick={() => isSelectionMode && toggleGallerySelection(img.id)}
+            className={`group relative aspect-square bg-white rounded-xl overflow-hidden border shadow-sm hover:shadow-md transition-all cursor-pointer ${
+              isSelectionMode && selectedGalleryIds.has(img.id) ? 'ring-2 ring-blue-500 border-transparent' : 'border-slate-200'
+            }`}
+          >
             <img src={img.url} alt={img.name} className="w-full h-full object-cover" />
+            
+            {/* Overlay for Name */}
             <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition-opacity flex flex-col justify-end p-3">
               <span className="text-white text-xs font-medium truncate w-full">{img.name}</span>
-              {img.hash && (
-                <span className="text-white/70 text-[10px] flex items-center gap-1 mt-1">
-                   <Fingerprint size={10} /> Hash ID: {img.hash.substring(0,8)}...
-                </span>
-              )}
             </div>
-            <div className="absolute top-2 right-2 bg-green-500 text-white text-[10px] px-2 py-0.5 rounded-full font-bold shadow-sm">
-              已保护
-            </div>
+
+            {/* Selection Checkbox */}
+            {isSelectionMode && (
+              <div className="absolute top-2 left-2 text-blue-500 bg-white rounded-md p-0.5 shadow-sm">
+                 {selectedGalleryIds.has(img.id) ? <CheckSquare size={20} fill="currentColor" className="text-blue-500 bg-white" /> : <Square size={20} className="text-slate-400" />}
+              </div>
+            )}
+
+            {!isSelectionMode && (
+              <div className="absolute top-2 right-2 bg-green-500 text-white text-[10px] px-2 py-0.5 rounded-full font-bold shadow-sm">
+                样本
+              </div>
+            )}
           </div>
         ))}
         
@@ -280,7 +372,7 @@ const App: React.FC = () => {
                 <ShieldCheck size={40} />
               </div>
               <h3 className="text-xl font-bold text-slate-800 mb-2">上传待检测图片</h3>
-              <p className="text-slate-500 mb-6">系统将自动运行 pHash 快速查重与 Gemini 深度语义鉴定。</p>
+              <p className="text-slate-500 mb-6">系统将自动运行快速查重与深度语义鉴定。</p>
               <button className="bg-blue-600 text-white px-8 py-3 rounded-full font-bold shadow-lg shadow-blue-200 group-hover:shadow-blue-300 transition-transform active:scale-95">
                 上传文件
               </button>
@@ -325,14 +417,14 @@ const App: React.FC = () => {
                 className="w-full mt-4 bg-blue-600 hover:bg-blue-700 text-white py-2.5 rounded-lg font-bold flex items-center justify-center gap-2 transition-all shadow-md shadow-blue-200 active:scale-95"
               >
                 <Search size={18} />
-                开始全库扫描
+                开始智能分析
               </button>
             )}
 
             {status.step !== 'idle' && status.step !== 'complete' && (
               <div className="mt-4">
                 <div className="flex justify-between text-xs font-bold text-blue-600 mb-1">
-                  <span>{status.progress}% 扫描中...</span>
+                  <span>分析中 {status.progress}%</span>
                 </div>
                 <div className="w-full bg-blue-100 rounded-full h-1.5 overflow-hidden mb-2">
                   <div 
@@ -518,7 +610,7 @@ const App: React.FC = () => {
 
                   <div className="bg-gradient-to-r from-indigo-50 to-white border border-indigo-100 rounded-2xl p-6">
                     <div className="mb-6">
-                      <h4 className="text-sm font-bold text-indigo-900 uppercase tracking-wide mb-2">修改建议</h4>
+                      <h4 className="text-sm font-bold text-indigo-900 uppercase tracking-wide mb-2">原始修改建议</h4>
                       <p className="text-indigo-800 font-medium">
                         {selectedResult.modificationSuggestion || "建议调整构图视角和主要配色，以产生差异化。"}
                       </p>
@@ -533,27 +625,27 @@ const App: React.FC = () => {
                          {isGeneratingPrompt ? (
                            <>
                              <RefreshCw className="animate-spin" size={18} />
-                             正在生成 Prompt...
+                             正在分析...
                            </>
                          ) : (
                            <>
                             <Wand2 size={18} />
-                            一键生成去风险提示词 (Prompt)
+                            获取具体的提示词修改策略 (中文)
                            </>
                          )}
                       </button>
                     ) : (
                       <div className="bg-white rounded-xl border border-indigo-200 p-5 shadow-sm">
                         <div className="flex justify-between items-center mb-3">
-                           <span className="text-xs font-bold text-indigo-500 uppercase">推荐的 Safe Prompt</span>
+                           <span className="text-xs font-bold text-indigo-500 uppercase">提示词修改建议 (Prompt Advice)</span>
                            <button onClick={() => setRefinedPrompt(null)} className="text-xs text-indigo-600 hover:underline">刷新</button>
                         </div>
-                        <div className="text-slate-600 text-sm font-mono bg-slate-50 p-3 rounded mb-4 border border-slate-100">
+                        <div className="text-slate-700 text-sm leading-relaxed whitespace-pre-wrap bg-slate-50 p-4 rounded-lg mb-4 border border-slate-100">
                           {refinedPrompt}
                         </div>
                         <div className="flex gap-3">
                           <button className="flex-1 bg-slate-900 text-white text-sm font-bold py-2 rounded-lg hover:bg-slate-800">
-                            复制提示词
+                            复制建议
                           </button>
                         </div>
                       </div>
@@ -576,6 +668,73 @@ const App: React.FC = () => {
     );
   };
 
+  const renderHistory = () => (
+    <div className="p-6 max-w-5xl mx-auto">
+      <div className="mb-6">
+        <h2 className="text-2xl font-bold text-slate-800">历史查询记录</h2>
+        <p className="text-slate-500 text-sm mt-1">
+          最近 10 次的风险评估记录。点击可查看详细报告。
+        </p>
+      </div>
+
+      {history.length === 0 ? (
+        <div className="bg-white rounded-xl border border-slate-200 p-12 text-center text-slate-400">
+          <Clock size={48} className="mx-auto mb-4 opacity-50" />
+          <p>暂无查询记录</p>
+        </div>
+      ) : (
+        <div className="space-y-4">
+          {history.map((record) => {
+            const highRiskCount = record.results.filter(r => r.scores.total >= 60).length;
+            const topScore = record.results.length > 0 
+                ? Math.max(...record.results.map(r => r.scores.total)) 
+                : 0;
+
+            return (
+              <div 
+                key={record.id} 
+                onClick={() => restoreHistory(record)}
+                className="bg-white rounded-xl border border-slate-200 p-4 hover:shadow-md transition-shadow cursor-pointer flex items-center gap-4"
+              >
+                <div className="w-20 h-20 bg-slate-100 rounded-lg overflow-hidden shrink-0">
+                  <img src={record.targetImage.url} alt="Thumbnail" className="w-full h-full object-cover" />
+                </div>
+                
+                <div className="flex-1">
+                  <div className="flex justify-between items-start">
+                     <h3 className="font-bold text-slate-800 text-lg mb-1">{record.targetImage.name}</h3>
+                     <span className="text-xs text-slate-400">
+                       {new Date(record.timestamp).toLocaleString('zh-CN')}
+                     </span>
+                  </div>
+                  
+                  <div className="flex gap-4 mt-2">
+                    <div className="flex flex-col">
+                      <span className="text-xs text-slate-500 uppercase font-bold">最高风险分</span>
+                      <span className={`text-lg font-bold ${topScore >= 60 ? 'text-red-500' : 'text-green-500'}`}>
+                        {topScore}
+                      </span>
+                    </div>
+                    <div className="flex flex-col">
+                      <span className="text-xs text-slate-500 uppercase font-bold">高风险匹配</span>
+                      <span className={`text-lg font-bold ${highRiskCount > 0 ? 'text-red-500' : 'text-slate-700'}`}>
+                        {highRiskCount} 张
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="bg-slate-50 p-2 rounded-full text-slate-400 group-hover:text-blue-500 transition-colors">
+                  <ArrowRight size={24} />
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col font-sans text-slate-900">
       <header className="bg-white border-b border-slate-200 sticky top-0 z-50 shadow-sm">
@@ -589,25 +748,33 @@ const App: React.FC = () => {
             </span>
           </div>
           
-          <div className="flex bg-slate-100 p-1 rounded-lg">
+          <div className="flex bg-slate-100 p-1 rounded-lg overflow-x-auto">
             <button 
               onClick={() => setAppState(AppState.GALLERY)}
-              className={`px-5 py-1.5 rounded-md text-sm font-bold transition-all ${appState === AppState.GALLERY ? 'bg-white text-slate-900 shadow-sm ring-1 ring-black/5' : 'text-slate-500 hover:text-slate-700'}`}
+              className={`px-5 py-1.5 rounded-md text-sm font-bold transition-all whitespace-nowrap ${appState === AppState.GALLERY ? 'bg-white text-slate-900 shadow-sm ring-1 ring-black/5' : 'text-slate-500 hover:text-slate-700'}`}
             >
-              资产库
+              样本库
             </button>
             <button 
               onClick={() => setAppState(AppState.ASSESS)}
-              className={`px-5 py-1.5 rounded-md text-sm font-bold transition-all ${appState === AppState.ASSESS ? 'bg-white text-slate-900 shadow-sm ring-1 ring-black/5' : 'text-slate-500 hover:text-slate-700'}`}
+              className={`px-5 py-1.5 rounded-md text-sm font-bold transition-all whitespace-nowrap ${appState === AppState.ASSESS ? 'bg-white text-slate-900 shadow-sm ring-1 ring-black/5' : 'text-slate-500 hover:text-slate-700'}`}
             >
               智能鉴别
+            </button>
+            <button 
+              onClick={() => setAppState(AppState.HISTORY)}
+              className={`px-5 py-1.5 rounded-md text-sm font-bold transition-all whitespace-nowrap ${appState === AppState.HISTORY ? 'bg-white text-slate-900 shadow-sm ring-1 ring-black/5' : 'text-slate-500 hover:text-slate-700'}`}
+            >
+              历史查询
             </button>
           </div>
         </div>
       </header>
 
       <main className="flex-1 max-w-[1400px] w-full mx-auto p-4 sm:px-6 lg:px-8 py-6">
-        {appState === AppState.GALLERY ? renderGallery() : renderAssessment()}
+        {appState === AppState.GALLERY && renderGallery()}
+        {appState === AppState.ASSESS && renderAssessment()}
+        {appState === AppState.HISTORY && renderHistory()}
       </main>
     </div>
   );

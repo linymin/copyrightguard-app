@@ -1,3 +1,4 @@
+
 export interface UploadedImage {
   id: string;
   url: string; // Base64 or Blob URL
@@ -32,9 +33,17 @@ export interface AssessmentResult {
   pHashMatch?: boolean; // Indicates if pHash detected high similarity
 }
 
+export interface HistoryRecord {
+  id: string;
+  timestamp: number;
+  targetImage: UploadedImage;
+  results: AssessmentResult[];
+}
+
 export enum AppState {
   GALLERY = 'GALLERY',
   ASSESS = 'ASSESS',
+  HISTORY = 'HISTORY',
 }
 
 export interface AnalysisStatus {
